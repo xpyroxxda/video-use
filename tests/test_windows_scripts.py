@@ -14,6 +14,12 @@ def test_runner_forces_utf8_for_windows_console_output():
     assert "$env:PYTHONUTF8 = '1'" in script
 
 
+def test_runner_adds_project_local_cuda_runtime_to_path():
+    script = Path("scripts/run-local.ps1").read_text(encoding="utf-8")
+
+    assert "Join-Path $repoRoot '.local\\cuda12'" in script
+
+
 def test_verify_checks_nvenc():
     script = Path("scripts/verify-local.ps1").read_text(encoding="utf-8")
 

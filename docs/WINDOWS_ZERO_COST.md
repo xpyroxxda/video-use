@@ -15,7 +15,7 @@ The first real transcription downloads the selected public Whisper model once in
 
 ## CUDA transcription prerequisite
 
-NVENC video encoding and CUDA Whisper inference are separate NVIDIA components. This PC must also have the CUDA 12 `cuBLAS` and cuDNN 9 runtime DLLs available on `PATH` for `faster-whisper` inference. If transcription reports a missing `cublas64_12.dll`, install those CUDA 12/cuDNN 9 runtime libraries, restart PowerShell, then rerun the smoke test. `faster-whisper` documents these as its GPU requirements; the CPU fallback below remains usable without them.
+NVENC video encoding and CUDA Whisper inference are separate NVIDIA components. This PC needs the CUDA 12 `cuBLAS` and cuDNN 9 runtime DLLs for `faster-whisper` inference. This installation keeps them under `.local\cuda12`; `run-local.ps1` prepends that directory to PATH only for the local project process. If transcription reports a missing `cublas64_12.dll`, restore those CUDA 12/cuDNN 9 runtime libraries there and rerun the smoke test. `faster-whisper` documents these as its GPU requirements; the CPU fallback below remains usable without them.
 
 ## Normal workflow
 
