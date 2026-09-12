@@ -13,3 +13,11 @@ def test_verify_checks_nvenc():
 
     assert "ffmpeg -encoders" in script
     assert "h264_nvenc" in script
+
+
+def test_windows_guide_uses_local_stack():
+    guide = Path("docs/WINDOWS_ZERO_COST.md").read_text(encoding="utf-8")
+
+    assert "faster-whisper" in guide
+    assert "h264_nvenc" in guide
+    assert "ELEVENLABS_API_KEY" not in guide
