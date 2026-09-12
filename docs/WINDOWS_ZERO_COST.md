@@ -13,6 +13,10 @@ powershell -ExecutionPolicy Bypass -File scripts/verify-local.ps1
 
 The first real transcription downloads the selected public Whisper model once into the local model cache. That needs internet only for the download; later media processing stays on the PC. The tool has no recurring API fee, although local electricity and disk space are still used.
 
+## CUDA transcription prerequisite
+
+NVENC video encoding and CUDA Whisper inference are separate NVIDIA components. This PC must also have the CUDA 12 `cuBLAS` and cuDNN 9 runtime DLLs available on `PATH` for `faster-whisper` inference. If transcription reports a missing `cublas64_12.dll`, install those CUDA 12/cuDNN 9 runtime libraries, restart PowerShell, then rerun the smoke test. `faster-whisper` documents these as its GPU requirements; the CPU fallback below remains usable without them.
+
 ## Normal workflow
 
 Keep source footage in its own folder. Outputs remain beside it in `edit\`.

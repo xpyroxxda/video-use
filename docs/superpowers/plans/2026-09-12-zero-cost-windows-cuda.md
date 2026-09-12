@@ -300,4 +300,3 @@ Run: `git status --short`
 Run: `git push -u origin main`
 
 Expected: no whitespace errors and tested commits published to `https://github.com/xpyroxxda/video-use`.
-
