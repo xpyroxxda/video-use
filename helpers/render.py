@@ -30,6 +30,11 @@ from fractions import Fraction
 from pathlib import Path
 
 try:
+    from local_runtime import LocalRuntime, load_runtime, video_encoder_args
+except ModuleNotFoundError:  # Supports imports as helpers.render in tests.
+    from helpers.local_runtime import LocalRuntime, load_runtime, video_encoder_args
+
+try:
     from grade import get_preset, auto_grade_for_clip  # same directory
 except Exception:
     def get_preset(name: str) -> str:
@@ -63,6 +68,16 @@ def run(cmd: list[str], quiet: bool = False) -> None:
     if not quiet:
         print(f"  $ {' '.join(str(c) for c in cmd[:6])}{' …' if len(cmd) > 6 else ''}")
     subprocess.run(cmd, check=True)
+
+
+def encoder_args_for_render(
+    runtime: LocalRuntime,
+    preview: bool,
+    draft: bool,
+) -> list[str]:
+    """Choose one local encoder profile for each render quality tier."""
+    quality = "draft" if draft else ("preview" if preview else "final")
+    return video_encoder_args(runtime, quality)
 
 
 def resolve_grade_filter(grade_field: str | None) -> str:
@@ -240,6 +255,7 @@ def extract_segment(
     preview: bool = False,
     draft: bool = False,
     rate: str | None = None,
+    runtime: LocalRuntime | None = None,
 ) -> None:
     """Extract a cut range as its own MP4 with grade + 30ms audio fades baked in.
 
@@ -247,9 +263,9 @@ def extract_segment(
     Portrait sources (height > width) are scaled by height to preserve orientation.
 
     Quality ladder:
-      - final (default): 1080p libx264 fast CRF 20
-      - preview:         1080p libx264 medium CRF 22 (evaluable for QC)
-      - draft:           720p libx264 ultrafast CRF 28 (cut-point check only)
+      - final (default): 1080p NVENC CQ 20
+      - preview:         1080p NVENC CQ 22 (evaluable for QC)
+      - draft:           720p NVENC CQ 28 (cut-point check only)
     """
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -271,18 +287,12 @@ def extract_segment(
     fade_out_start = max(0.0, duration - 0.03)
     af = f"afade=t=in:st=0:d=0.03,afade=t=out:st={fade_out_start:.3f}:d=0.03"
 
-    if draft:
-        preset, crf = "ultrafast", "28"
-    elif preview:
-        preset, crf = "medium", "22"
-    else:
-        preset, crf = "fast", "20"
-
     # Frame rate: use the rate the caller resolved once for the whole render
     # (every segment must share it — concat -c copy in Rule 2 requires a uniform
     # frame rate). When called standalone with no rate, preserve this source's
     # own rate; fall back to 24 only if it can't be probed.
     out_rate = rate if rate is not None else (probe_source_fps(source) or "24")
+    runtime = runtime or load_runtime()
 
     cmd = [
         "ffmpeg", "-y",
@@ -291,7 +301,7 @@ def extract_segment(
         "-t", f"{duration:.3f}",
         "-vf", vf,
         "-af", af,
-        "-c:v", "libx264", "-preset", preset, "-crf", crf,
+        *encoder_args_for_render(runtime, preview, draft),
         "-pix_fmt", "yuv420p", "-r", out_rate,
         "-c:a", "aac", "-b:a", "192k", "-ar", "48000",
         "-movflags", "+faststart",
@@ -306,6 +316,7 @@ def extract_all_segments(
     preview: bool,
     draft: bool = False,
     fps: str | None = None,
+    runtime: LocalRuntime | None = None,
 ) -> list[Path]:
     """Extract every EDL range into edit_dir/clips_graded/seg_NN.mp4.
     Returns the ordered list of segment paths.
@@ -314,6 +325,7 @@ def extract_all_segments(
     `auto_grade_for_clip` and apply a per-segment subtle correction.
     Otherwise, apply the same preset/raw filter to every segment.
     """
+    runtime = runtime or load_runtime()
     resolved = resolve_grade_filter(edl.get("grade"))
     is_auto = resolved == "__AUTO__"
     clips_dir = edit_dir / (
@@ -359,7 +371,17 @@ def extract_all_segments(
         print(f"  [{i:02d}] {src_name}  {start:7.2f}-{end:7.2f}  ({duration:5.2f}s)  {note}")
         if is_auto:
             print(f"        grade: {seg_filter or '(none)'}")
-        extract_segment(src_path, start, duration, seg_filter, out_path, preview=preview, draft=draft, rate=out_rate)
+        extract_segment(
+            src_path,
+            start,
+            duration,
+            seg_filter,
+            out_path,
+            preview=preview,
+            draft=draft,
+            rate=out_rate,
+            runtime=runtime,
+        )
         seg_paths.append(out_path)
 
     return seg_paths
@@ -603,11 +625,13 @@ def build_final_composite(
     subtitles_path: Path | None,
     out_path: Path,
     edit_dir: Path,
+    runtime: LocalRuntime | None = None,
 ) -> None:
     """Final pass: base → overlays (PTS-shifted) → subtitles LAST → out.
 
     If there are no overlays and no subtitles, just copy base to out.
     """
+    runtime = runtime or load_runtime()
     has_overlays = bool(overlays)
     has_subs = subtitles_path is not None and subtitles_path.exists()
 
@@ -662,7 +686,7 @@ def build_final_composite(
         "-filter_complex", filter_complex,
         "-map", out_label,
         "-map", "0:a",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        *encoder_args_for_render(runtime, preview=False, draft=False),
         "-pix_fmt", "yuv420p",
         "-c:a", "copy",
         "-movflags", "+faststart",
@@ -722,10 +746,11 @@ def main() -> None:
     edl = json.loads(edl_path.read_text())
     edit_dir = edl_path.parent
     out_path = args.output.resolve()
+    runtime = load_runtime()
 
     # 1. Extract per-segment (auto-grade per range if EDL grade is "auto")
     segment_paths = extract_all_segments(
-        edl, edit_dir, preview=args.preview, draft=args.draft, fps=args.fps
+        edl, edit_dir, preview=args.preview, draft=args.draft, fps=args.fps, runtime=runtime
     )
 
     # 2. Concat → base
@@ -754,11 +779,11 @@ def main() -> None:
     overlays = edl.get("overlays") or []
     if args.no_loudnorm:
         # Composite directly to final output
-        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, out_path, edit_dir, runtime=runtime)
     else:
         # Composite to a temp file, then run loudnorm → final output
         tmp_composite = out_path.with_suffix(".prenorm.mp4")
-        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir)
+        build_final_composite(base_path, overlays, subs_path, tmp_composite, edit_dir, runtime=runtime)
         print("loudness normalization → social-ready (-14 LUFS / -1 dBTP / LRA 11)")
         apply_loudnorm_two_pass(tmp_composite, out_path, preview=args.draft)
         tmp_composite.unlink(missing_ok=True)
