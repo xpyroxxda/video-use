@@ -28,8 +28,8 @@ try {
         }
     }
 
-    $encoders = & ffmpeg -encoders 2>&1
-    if ($encoders -notmatch 'h264_nvenc') {
+    $encoders = & cmd.exe /d /c "ffmpeg -encoders 2>&1"
+    if (($encoders -join "`n") -notmatch 'h264_nvenc') {
         throw 'FFmpeg does not expose h264_nvenc. Update the NVIDIA driver or install an FFmpeg build with NVENC enabled.'
     }
 

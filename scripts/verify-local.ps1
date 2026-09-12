@@ -14,8 +14,8 @@ if (-not (Test-Path -LiteralPath $venvPython)) {
 & $venvPython -c "import faster_whisper; print('faster-whisper import: OK')"
 & nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
 
-$encoders = & ffmpeg -encoders 2>&1
-if ($encoders -notmatch 'h264_nvenc') {
+$encoders = & cmd.exe /d /c "ffmpeg -encoders 2>&1"
+if (($encoders -join "`n") -notmatch 'h264_nvenc') {
     throw 'h264_nvenc is not available in this FFmpeg build.'
 }
 Write-Host 'FFmpeg h264_nvenc: available'
