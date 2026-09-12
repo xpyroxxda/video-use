@@ -1,6 +1,6 @@
-"""Batch-transcribe every video in a directory with 4 parallel workers.
+"""Batch-transcribe every video in a directory using local faster-whisper.
 
-Walks <videos_dir> for common video extensions, runs ElevenLabs Scribe on
+Walks <videos_dir> for common video extensions, runs local faster-whisper on
 each, writes transcripts to <videos_dir>/edit/transcripts/<name>.json.
 
 Cached per-file: any source that already has a transcript is skipped.
@@ -20,7 +20,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from transcribe import load_api_key, transcribe_one, transcript_path
+try:
+    from local_runtime import load_runtime
+    from transcribe import transcribe_one, transcript_path
+except ModuleNotFoundError:  # Supports imports as helpers.transcribe_batch.
+    from helpers.local_runtime import load_runtime
+    from helpers.transcribe import transcribe_one, transcript_path
 
 
 VIDEO_EXTS = {".mp4", ".MP4", ".mov", ".MOV", ".mkv", ".MKV", ".avi", ".AVI", ".m4v"}
@@ -43,7 +48,7 @@ def main() -> None:
         default=None,
         help="Edit output directory (default: <videos_dir>/edit)",
     )
-    ap.add_argument("--workers", type=int, default=4, help="Parallel workers (default: 4)")
+    ap.add_argument("--workers", type=int, default=1, help="Parallel workers (default: 1 for GPU safety)")
     ap.add_argument(
         "--language",
         type=str,
@@ -84,9 +89,14 @@ def main() -> None:
         print("nothing to do")
         return
 
-    api_key = load_api_key()
+    runtime = load_runtime()
+    if runtime.device == "cuda" and args.workers > 1:
+        print("warning: each CUDA worker loads a full model and can exhaust VRAM")
 
-    print(f"transcribing {len(pending)} files with {args.workers} parallel workers")
+    print(
+        f"transcribing {len(pending)} files with {args.workers} worker(s) "
+        f"using {runtime.model} on {runtime.device}"
+    )
     t0 = time.time()
 
     errors: list[tuple[Path, str]] = []
@@ -96,7 +106,7 @@ def main() -> None:
                 transcribe_one,
                 video=v,
                 edit_dir=edit_dir,
-                api_key=api_key,
+                runtime=runtime,
                 language=args.language,
                 num_speakers=args.num_speakers,
                 verbose=False,

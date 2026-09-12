@@ -1,8 +1,8 @@
-"""Transcribe a video with ElevenLabs Scribe.
+"""Transcribe a video locally with faster-whisper.
 
-Extracts mono 16kHz audio via ffmpeg, uploads to Scribe with verbatim +
-diarize + audio events + word-level timestamps, writes the full response
-to <edit_dir>/transcripts/<video_stem>.json.
+Extracts mono 16kHz audio via ffmpeg, runs a local CUDA-capable model with
+word-level timestamps, and writes compatible JSON to
+<edit_dir>/transcripts/<video_stem>.json.
 
 Cached: if the output file already exists, the upload is skipped.
 
@@ -27,26 +27,10 @@ import time
 import wave
 from pathlib import Path
 
-import requests
-
-
-SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text"
-
-
-def load_api_key() -> str:
-    for candidate in [Path(__file__).resolve().parent.parent / ".env", Path(".env")]:
-        if candidate.exists():
-            for line in candidate.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                if k.strip() == "ELEVENLABS_API_KEY":
-                    return v.strip().strip('"').strip("'")
-    v = os.environ.get("ELEVENLABS_API_KEY", "")
-    if not v:
-        sys.exit("ELEVENLABS_API_KEY not found in .env or environment")
-    return v
+try:
+    from local_runtime import LocalRuntime, load_runtime
+except ModuleNotFoundError:  # Supports imports as helpers.transcribe in tests.
+    from helpers.local_runtime import LocalRuntime, load_runtime
 
 
 def count_audio_tracks(video_path: Path) -> int:
@@ -81,36 +65,56 @@ def extract_audio(video_path: Path, dest: Path, audio_track: int = 0) -> None:
     subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def call_scribe(
-    audio_path: Path,
-    api_key: str,
-    language: str | None = None,
-    num_speakers: int | None = None,
-) -> dict:
-    data: dict[str, str] = {
-        "model_id": "scribe_v1",
-        "diarize": "true",
-        "tag_audio_events": "true",
-        "timestamps_granularity": "word",
+def to_transcript_payload(info: object, segments: list[object]) -> dict:
+    """Convert faster-whisper results into the existing word-level schema."""
+    words: list[dict] = []
+    text: list[str] = []
+    for segment in segments:
+        for word in getattr(segment, "words", None) or []:
+            value = str(getattr(word, "word", "")).strip()
+            if not value:
+                continue
+            text.append(value)
+            words.append({
+                "text": value,
+                "start": round(float(word.start), 3),
+                "end": round(float(word.end), 3),
+                "type": "word",
+                "speaker_id": "speaker_0",
+            })
+    return {
+        "text": " ".join(text),
+        "words": words,
+        "language_code": getattr(info, "language", None),
+        "provider": "faster-whisper",
     }
-    if language:
-        data["language_code"] = language
-    if num_speakers:
-        data["num_speakers"] = str(num_speakers)
 
-    with open(audio_path, "rb") as f:
-        resp = requests.post(
-            SCRIBE_URL,
-            headers={"xi-api-key": api_key},
-            files={"file": (audio_path.name, f, "audio/wav")},
-            data=data,
-            timeout=1800,
-        )
 
-    if resp.status_code != 200:
-        raise RuntimeError(f"Scribe returned {resp.status_code}: {resp.text[:500]}")
+def transcribe_audio_locally(
+    audio_path: Path,
+    runtime: LocalRuntime,
+    language: str | None = None,
+) -> dict:
+    """Run faster-whisper locally without initializing CUDA for --help."""
+    try:
+        from faster_whisper import WhisperModel
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "faster-whisper is not installed. Run scripts/setup-windows.ps1 first."
+        ) from exc
 
-    return resp.json()
+    model = WhisperModel(
+        runtime.model,
+        device=runtime.device,
+        compute_type=runtime.compute_type,
+    )
+    segments, info = model.transcribe(
+        str(audio_path),
+        word_timestamps=True,
+        language=language,
+        vad_filter=True,
+    )
+    return to_transcript_payload(info, list(segments))
 
 
 def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
@@ -128,7 +132,7 @@ def transcript_path(edit_dir: Path, video: Path, audio_track: int = 0) -> Path:
 def transcribe_one(
     video: Path,
     edit_dir: Path,
-    api_key: str,
+    runtime: LocalRuntime,
     language: str | None = None,
     num_speakers: int | None = None,
     verbose: bool = True,
@@ -160,13 +164,13 @@ def transcribe_one(
         audio = Path(tmp) / f"{video.stem}.wav"
         extract_audio(video, audio, audio_track)
 
-        # Uploading silence costs the same as uploading speech and returns
-        # nothing, so catch the wrong-track case before paying for it.
+        # Avoid sending an empty source through local inference and catch a
+        # likely wrong-track selection before a long model run.
         peak = peak_dbfs(audio)
         if peak < -60.0:
             raise RuntimeError(
                 f"track {audio_track + 1} of {video.name} is silent "
-                f"(peak {peak:.1f} dBFS) - not uploading. "
+                f"(peak {peak:.1f} dBFS) - not transcribing. "
                 + (f"The file has {n_tracks} audio tracks; try --audio-track "
                    + " or ".join(str(i) for i in range(n_tracks) if i != audio_track) + "."
                    if n_tracks > 1 else "Check the source audio.")
@@ -174,8 +178,14 @@ def transcribe_one(
 
         size_mb = audio.stat().st_size / (1024 * 1024)
         if verbose:
-            print(f"  uploading {video.stem}.wav ({size_mb:.1f} MB)", flush=True)
-        payload = call_scribe(audio, api_key, language, num_speakers)
+            print(
+                f"  transcribing {video.stem}.wav ({size_mb:.1f} MB) "
+                f"with {runtime.model} on {runtime.device}",
+                flush=True,
+            )
+        if num_speakers and verbose:
+            print("  note: local faster-whisper does not diarize speakers", flush=True)
+        payload = transcribe_audio_locally(audio, runtime, language)
 
     out_path.write_text(json.dumps(payload, indent=2))
     dt = time.time() - t0
@@ -190,7 +200,7 @@ def transcribe_one(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Transcribe a video with ElevenLabs Scribe")
+    ap = argparse.ArgumentParser(description="Transcribe a video locally with faster-whisper")
     ap.add_argument("video", type=Path, help="Path to video file")
     ap.add_argument(
         "--edit-dir",
@@ -225,12 +235,12 @@ def main() -> None:
         sys.exit(f"video not found: {video}")
 
     edit_dir = (args.edit_dir or (video.parent / "edit")).resolve()
-    api_key = load_api_key()
+    runtime = load_runtime()
 
     transcribe_one(
         video=video,
         edit_dir=edit_dir,
-        api_key=api_key,
+        runtime=runtime,
         language=args.language,
         num_speakers=args.num_speakers,
         audio_track=args.audio_track,
